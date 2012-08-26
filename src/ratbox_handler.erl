@@ -6,6 +6,16 @@
 
 handle_message(State, Message) ->
     handle_one_message(State, Message#message.prefix, Message#message.command, Message#message.arguments).
+handle_one_message(State, _Prefix, '001', _Arguments) ->
+    Config = client:config(State),
+    case config:operator(Config) of
+        true ->
+            client:send(State, {oper, config:operator_username(Config), config:operator_password(Config)});
+        false ->
+            State
+    end;
+handle_one_message(_State, _Prefix, '461', _Arguments) ->
+    throw(operator_authentication_failed);
 handle_one_message(_State, _Prefix, '491', _Arguments) ->
     throw(operator_authentication_failed);
 handle_one_message(State, _Prefix, notice, [<<"*">>, Arguments]) ->

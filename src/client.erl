@@ -1,41 +1,49 @@
 -module(client).
--export([start/1, start/3, stop/1]).
--export([quit/2, ping/1, send/2]).
+-export([start/1, stop/2]).
+-export([quit/3, ping/2, send/2, config/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -behaviour(gen_server).
 
--define(PING_INTERVAL, 60).
--define(PING_TIMEOUT, 180).
-
 -include("protocol.hrl").
--include("client.hrl").
+-include("config.hrl").
 
-start(Network, Hostname, Port) ->
-    start(#configuration{ network = Network, hostname = Hostname, port = Port }).
+-record(state, {
+    config :: #config{},
+    continuation :: binary(),
+    socket :: inet:socket(),
+    ping_timer :: timer:tref(),
+    pong_timestamp :: calendar:datetime()
+}).
 
-start(#configuration{ network = Network } = Configuration) ->
-    gen_server:start_link({local, Network}, ?MODULE, Configuration, []).
+config(#state { config = Config }) ->
+    Config.
 
-stop(Network) when is_atom(Network) ->
-    gen_server:call(Network, stop).
+atomify(Network, Hostname) ->
+    list_to_atom(atom_to_list(Network) ++ "/" ++ Hostname).
 
-quit(Network, Message) ->
-    gen_server:call(Network, {quit, Message}).
+start(#config{ network = Network, hostname = Hostname } = Config) ->
+    gen_server:start_link({local, atomify(Network, Hostname)}, ?MODULE, Config, []).
 
-ping(Network) ->
-    gen_server:cast(Network, ping).
+stop(Network, Hostname) when is_list(Hostname) ->
+    gen_server:call(atomify(Network, Hostname), stop).
+
+quit(Network, Hostname, Message) ->
+    gen_server:call(atomify(Network, Hostname), {quit, Message}).
+
+ping(Network, Hostname) ->
+    gen_server:cast(atomify(Network, Hostname), ping).
 
 init(Config) ->
-    case ssl:connect(Config#configuration.hostname, Config#configuration.port, [binary, {packet, 0}, {active, once}]) of
+    Transport = config:transport(Config),
+    case Transport:connect(config:hostname(Config), config:port(Config), [binary, {packet, 0}, {active, once}]) of
         {ok, Socket} ->
-            irc:send(Socket, Config#configuration.network, {nick, "ahfbot"}),
-            irc:send(Socket, Config#configuration.network, {user, "insight", "XXX", "XXX", "IRC Monitor"}),
             State = #state{ continuation = <<>>,
-                            configuration = Config,
+                            config = Config,
                             socket = Socket,
                             ping_timer = undefined,
-                            pong_timestamp = erlang:localtime(),
-                            ircd_handler = ratbox_handler },
+                            pong_timestamp = erlang:localtime() },
+            send(State, {nick, config:nickname(Config)}),
+            send(State, {user, config:username(Config), "XXX", "XXX", config:realname(Config)}),
             {ok, start_ping_timer(State)};
         {error, Reason} ->
             {stop, Reason}
@@ -53,8 +61,7 @@ handle_call(_Request, _From, State) ->
 handle_cast(ping, State) ->
     case check_time_difference(State) of
         ok ->
-            C = State#state.configuration,
-            send(State, {ping, C#configuration.hostname}),
+            send(State, {ping, config:hostname(config(State))}),
             {noreply, reset_ping_timer(State)};
         Error ->
             % We should quit with an error message a la: "No data from server:
@@ -70,22 +77,32 @@ handle_info({ssl_closed, Socket}, #state { socket = Socket} = State) ->
     {stop, closed, State};
 handle_info({ssl_error, Socket, Reason}, #state { socket = Socket} = State) ->
     {stop, Reason, State};
+handle_info({tcp, Socket, Packet}, #state { socket = Socket } = State) ->
+    handle_packet(Packet, State);
+handle_info({tcp_closed, Socket}, #state { socket = Socket } = State) ->
+    {stop, closed, State};
+handle_info({tcp_error, Socket, Reason}, #state { socket = Socket} = State) ->
+    {stop, Reason, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
-    ssl:close(State#state.socket),
+    Config = config(State),
+    Transport = config:transport(Config),
+    Transport:close(State#state.socket),
     stop_ping_timer(State),
     ok.
 
 code_change(_OldVersion, State, _Extra) ->
     {ok, State}.
 
-ack_socket(Socket) ->
-    ssl:setopts(Socket, [{active, once}]).
+ack_socket(State) ->
+    Config = config(State),
+    Transport = config:transport(Config),
+    Transport:setopts(State#state.socket, [{active, once}]).
 
-handle_packet(Chunk, #state { continuation = Cont, socket = Socket  } = State) ->
-    ack_socket(Socket),
+handle_packet(Chunk, #state { continuation = Cont } = State) ->
+    ack_socket(State),
     try
         case process_packet(Chunk, Cont) of
             {messages, Messages, NewCont} ->
@@ -117,7 +134,8 @@ return_messages(Messages, Data) ->
 
 handle_line(Line, State) ->
     NewState = reset_ping_timer(State#state { pong_timestamp = erlang:localtime() }),
-    IrcdHandler = State#state.ircd_handler,
+    Config = config(State),
+    IrcdHandler = config:ircd_handler(Config),
     case protocol:parse(Line) of
         {ok, Message} ->
             NewState2 = handle_message(NewState, Message),
@@ -127,8 +145,8 @@ handle_line(Line, State) ->
     end.
 
 handle_message(State, Message) ->
-    C = State#state.configuration,
-    io:format("(~s) -> ~s~n", [atom_to_list(C#configuration.network), protocol:render(Message)]),
+    Config = config(State),
+    io:format("(~s/~s) -> ~s~n", [atom_to_list(config:network(Config)), config:hostname(Config), protocol:render(Message)]),
     handle_one_message(Message#message.prefix, Message#message.command, Message#message.arguments, State).
 
 handle_one_message(<<>>, ping, [Argument], State) ->
@@ -151,13 +169,16 @@ handle_one_privmsg(_Hostmask, _Arguments, State) ->
     State.
 
 send(State, Message) ->
-    C = State#state.configuration,
-    irc:send(State#state.socket, C#configuration.network, Message),
+    Config = config(State),
+    Transport = config:transport(Config),
+    Text = irc:render(Message),
+    io:format("(~s/~s) <- ~s~n", [atom_to_list(config:network(Config)), config:hostname(Config), Text]),
+    Transport:send(State#state.socket, [Text, "\r\n"]),
     State.
 
 start_ping_timer(State) ->
-    C = State#state.configuration,
-    {ok, PingTimer} = timer:apply_after(?PING_INTERVAL * 1000, client, ping, [C#configuration.network]),
+    Config = config(State),
+    {ok, PingTimer} = timer:apply_after(config:ping_interval(Config) * 1000, client, ping, [config:network(Config), config:hostname(Config)]),
     State#state{ ping_timer = PingTimer }.
 
 stop_ping_timer(#state { ping_timer = PingTimer } = State) ->
@@ -168,9 +189,10 @@ reset_ping_timer(State) ->
     start_ping_timer(stop_ping_timer(State)).
 
 check_time_difference(State) ->
+    PingTimeout = config:ping_timeout(config(State)),
     Delta = calendar:datetime_to_gregorian_seconds(erlang:localtime()) - calendar:datetime_to_gregorian_seconds(State#state.pong_timestamp),
     if
-        Delta >= ?PING_TIMEOUT ->
+        Delta >= PingTimeout ->
             {ping_timeout, Delta};
         true ->
             ok

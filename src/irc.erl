@@ -1,5 +1,5 @@
 -module(irc).
--export([send/3]).
+-export([render/1]).
 
 render({nick, Nickname}) ->
     io_lib:format("NICK ~s", [Nickname]);
@@ -21,8 +21,3 @@ render({mode, Target, Mode}) ->
     io_lib:format("MODE ~s ~s", [Target, Mode]);
 render({user, Username, Hostname, Servername, Realname}) ->
     io_lib:format("USER ~s ~s ~s :~s", [Username, Hostname, Servername, Realname]).
-
-send(Socket, Network, Message) ->
-    Data = render(Message),
-    io:format("(~s) <- ~s~n", [atom_to_list(Network), Data]),
-    ssl:send(Socket, [Data, "\r\n"]).
