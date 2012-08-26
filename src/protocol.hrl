@@ -1,5 +1,5 @@
 -record(message, {
     prefix :: binary(),
-    command :: binary(),
+    command :: atom(),
     arguments :: [binary()]
 }).
