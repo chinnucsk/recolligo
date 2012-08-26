@@ -31,12 +31,13 @@ transport(#config { transport = Transport }) ->
 nickname(#config { options = Options }) ->
     proplists:get_value(nickname, Options, "recolligo").
 
-alternative_nickname(#config { options = Options }) ->
+alternative_nickname(#config { options = Options } = Config) ->
+    CurrentNickname = nickname(Config),
     case proplists:get_value(alternative_nickname, Options, "recolligo_") of
         Nickname when is_list(Nickname) ->
             Nickname;
         Fun when is_function(Fun) ->
-            Fun();
+            Fun(CurrentNickname);
         X ->
             X
     end.
