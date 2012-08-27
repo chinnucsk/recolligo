@@ -18,20 +18,17 @@
 config(#state { config = Config }) ->
     Config.
 
-atomify(Network, Hostname) ->
-    list_to_atom(atom_to_list(Network) ++ "/" ++ Hostname).
-
-start(#config{ network = Network, hostname = Hostname } = Config) ->
-    gen_server:start_link({local, atomify(Network, Hostname)}, ?MODULE, Config, []).
+start(Config) ->
+    gen_server:start_link(?MODULE, Config, []).
 
 stop(Network, Hostname) when is_list(Hostname) ->
-    gen_server:call(atomify(Network, Hostname), stop).
+    gen_server:call(gproc:where({n, l, {irc_client, Network, Hostname}}), stop).
 
 quit(Network, Hostname, Message) ->
-    gen_server:call(atomify(Network, Hostname), {quit, Message}).
+    gen_server:call(gproc:where({n, l, {irc_client, Network, Hostname}}), {quit, Message}).
 
 ping(Network, Hostname) ->
-    gen_server:cast(atomify(Network, Hostname), ping).
+    gen_server:cast(gproc:where({n, l, {irc_client, Network, Hostname}}), ping).
 
 init(Config) ->
     Transport = config:transport(Config),
@@ -44,6 +41,7 @@ init(Config) ->
                             pong_timestamp = erlang:localtime() },
             send(State, {nick, config:nickname(Config)}),
             send(State, {user, config:username(Config), "XXX", "XXX", config:realname(Config)}),
+            gproc:add_local_name({irc_client, config:network(Config), config:hostname(Config)}),
             {ok, start_ping_timer(State)};
         {error, Reason} ->
             {stop, Reason}
